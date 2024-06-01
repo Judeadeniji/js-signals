@@ -1,0 +1,557 @@
+// signals.js (unstable)
+// Author: Adeniji Oluwaferanmi
+// github: https://github.com/Judeadeniji/js-signals
+
+/** @type {Set<Signal<any> | Computed<any>>} **/
+const activeSignals = new Set();
+
+/** @type {Effect | null} **/
+let currentEffect = null;
+let isBatching = false;
+let VERSION = 0;
+
+function cyclicDependency() {
+    console.warn(new Error("Possible Cyclic Dependency Detected."));
+}
+
+function signalUpdateInEffect() {
+    throw new Error("Improper Signal update in Effect detected!");
+}
+
+/**
+ * @template T
+ * @param {any} value
+ * @returns {T}
+ */
+function safeCopy(value) {
+    const str = value.toString();
+    if (!value) return value;
+    if (typeof value !== "object") {
+        return value;
+    }
+
+    //@ts-ignore
+    if (Array.isArray(value)) return [...value];
+    if ("[object Object]" === str) {
+        return { ...value };
+    }
+
+    return value;
+}
+
+/**
+ * DeepProxy class for observing changes in objects or arrays.
+ * @template T extends any
+ */
+class DeepProxy {
+    /**
+     * @param {T} target - The target object or array to observe.
+     * @param {() => void} onChange - Callback function to call on changes.
+     */
+    constructor(target, onChange) {
+        this.onChange = onChange;
+        this.target = target;
+        this.observe(target);
+    }
+
+    /**
+     * @param {any} target
+     */
+    observe(target) {
+        if (target && typeof target === "object") {
+            if (target[Symbol.iterator]) {
+                this.handleArray(target);
+            } else {
+                this.handleObject(target);
+            }
+        }
+    }
+
+    /**
+     * @param {any} target
+     */
+    handleArray(target) {
+        //@ts-ignore
+        target.forEach(item => this.observe(item));
+        const proxy = new Proxy([...target], {
+            set: (target, property, value) => {
+                //@ts-ignore
+                target[property] = value;
+                this.onChange();
+                return true;
+            },
+            deleteProperty: (target, property) => {
+                //@ts-ignore
+                delete target[property];
+                this.onChange();
+                return true;
+            }
+        });
+        Reflect.setPrototypeOf(target, proxy);
+    }
+
+    /**
+     * @param {any} target
+     */
+    handleObject(target) {
+        Object.keys(target).forEach(key => {
+            this.observe(target[key]);
+        });
+        const proxy = new Proxy(
+            { ...target },
+            {
+                set: (target, property, value) => {
+                    target[property] = value;
+                    this.onChange();
+                    return true;
+                },
+                deleteProperty: (target, property) => {
+                    delete target[property];
+                    this.onChange();
+                    return true;
+                }
+            }
+        );
+        Reflect.setPrototypeOf(target, proxy);
+    }
+}
+
+/**
+ * Class representing a reactive signal.
+ * @template T
+ */
+class Signal {
+    /** @type {T} **/
+    _value;
+    /** @type {Set<(value: T) => void>} **/
+    _listeners = new Set();
+    /** @type {Set<Effect | Computed<T> | Signal<T>>} **/
+    _dependents = new Set();
+    /** @type {number} **/
+    _version;
+    /** @type {number} **/
+    _prevVersion;
+
+    /**
+     * @param {T} initialValue - The initial value of the signal.
+     * @param {{ deep: boolean }} [opts={deep: false}] - Options for the signal.
+     */
+    constructor(initialValue, opts = { deep: false }) {
+        const self = this;
+        this._value = initialValue;
+        this._version = VERSION++;
+        this._prevVersion = this._version;
+        this.opts = Object.freeze(opts);
+
+        if (opts.deep) {
+            new DeepProxy(self._value, () => {
+                self._prevVersion = this._version;
+                self._version = VERSION++;
+                self._value = self._value;
+                //@ts-ignore
+                self._notify(safeCopy(self._value.__proto__));
+                if (!isBatching) {
+                    self._notifyDependents();
+                }
+            });
+        }
+    }
+
+    /**
+     * Returns the signal's value without triggering reactivity.
+     * @returns {T} The current value of the signal.
+     */
+    peek() {
+        return safeCopy(this._value);
+    }
+
+    /**
+     * Gets the value of the signal.
+     * @returns {T} The current value of the signal.
+     */
+    get value() {
+        !currentEffect && activeSignals.add(this);
+        return currentEffect
+            ? safeCopy(
+                  this.opts.deep
+                      // @ts-ignore
+                      ? Reflect.getPrototypeOf(this._value)
+                      : this._value
+              )
+            : this._value;
+    }
+
+    /**
+     * Sets the value of the signal and notifies listeners.
+     * @param {T} newValue - The new value to set.
+     */
+    set value(newValue) {
+        if (this._value === newValue) return;
+        if (currentEffect) {
+            currentEffect._signalUpdateInEffect();
+            return;
+        }
+        this._prevVersion = this._version;
+        this._version = VERSION++;
+        this._value = newValue;
+        this._notify(safeCopy(this._value));
+        if (!isBatching) {
+            this._notifyDependents();
+        }
+    }
+
+    /**
+     * Subscribes a listener to the signal.
+     * @param {(value: T) => void} listener - The listener function to subscribe.
+     * @returns {() => void} A function to unsubscribe the listener.
+     */
+    subscribe(listener) {
+        this._listeners.add(listener);
+        return () => this._listeners.delete(listener);
+    }
+
+    /**
+     * @param {T} value
+     */
+    _notify(value) {
+        this._listeners.forEach(listener => {
+            listener(this._value);
+        });
+    }
+
+    _notifyDependents() {
+        this._dependents.forEach(dep => {
+          // @ts-ignore
+            dep._execute && dep._execute();
+        });
+    }
+
+    /**
+     * Adds a dependent effect to the signal.
+     * @param {Effect | Computed<T>} effect - The effect to add as a dependent.
+     */
+    addDependent(effect) {
+        this._dependents.add(effect);
+    }
+
+    /**
+     * Removes a dependent effect from the signal.
+     * @param {Effect} effect - The effect to remove as a dependent.
+     */
+    removeDependent(effect) {
+        this._dependents.delete(effect);
+    }
+}
+
+/**
+ * @typedef {() => void | (() => void)} EffectCallback
+ */
+
+/**
+ * Class representing an effect that reacts to signal changes.
+ */
+class Effect {
+    /** @type {EffectCallback} **/
+    _callback;
+    /** @type {ReturnType<EffectCallback>} **/
+    _cleanup;
+    /** @type {number} **/
+    _version;
+    /** @type {number} **/
+    _prevVersion;
+    /** @type {Set<Signal<any> | Computed<any>>} **/
+    _dependents = new Set();
+
+    /**
+     * @param {EffectCallback} callback - The callback function to run as an effect.
+     */
+    constructor(callback) {
+        activeSignals.clear(); // remove existing signals if any to prevent Dependency mismatch
+        this._callback = callback;
+        this._version = VERSION++;
+        this._prevVersion = this._version;
+        this._cleanup = this._callback();
+        this._track();
+    }
+
+    _track() {
+        activeSignals.forEach(dep /** @type {Signal<any>} **/=> {
+            dep.addDependent(this);
+            this._dependents.add(dep);
+        });
+        activeSignals.clear();
+    }
+    
+    _signalUpdateInEffect() {
+      signalUpdateInEffect();
+    }
+
+    _execute() {
+        currentEffect = this;
+        /*
+        In actualty execute would not be called if signal value hasn't changed,
+        but it is always good to have an extra guard
+        */
+        const shouldRecompute = [...this._dependents].some(
+            depObj => depObj._prevVersion !== depObj._version
+        );
+        if (shouldRecompute) {
+            if (this._cleanup instanceof Promise) {
+              this._signalUpdateInEffect();
+            }
+            if (typeof this._cleanup === "function") {
+                this._cleanup();
+                this._cleanup = undefined;
+            }
+            this._cleanup = this._callback();
+            this._track();
+        }
+        currentEffect = null;
+    }
+
+    _untrack() {
+        if (typeof this._cleanup === "function") {
+            this._cleanup();
+            this._cleanup = undefined;
+        }
+
+        this._dependents.forEach(dep => {
+            dep.removeDependent(this);
+        });
+
+        this._dependents.clear();
+    }
+}
+
+/**
+ * Class representing a computed signal.
+ * @template T
+ * @extends Signal<T>
+ */
+class Computed extends Signal {
+    /** @type {() => T} **/
+    _compute;
+    _shouldBlock = false;
+
+    /**
+     * @param {() => T} compute - The compute function to create the computed signal.
+     */
+    constructor(compute) {
+        activeSignals.clear();
+        super(compute());
+        this._compute = compute;
+        this.is_first_exec = true;
+        this._track();
+    }
+
+    _track() {
+        activeSignals.forEach(signal => {
+            this._dependents.add(signal);
+            signal.addDependent(this);
+        });
+    }
+
+    _untrack() {
+        this._dependents.clear();
+    }
+
+    _computeValue() {
+        const shouldRecompute = [...this._dependents].some(
+            signal => signal._version !== signal._prevVersion
+        );
+
+        if (!this.is_first_exec && !shouldRecompute) {
+            return this._value;
+        }
+        
+        const value = this._compute();
+        this.is_first_exec = false;
+        return value;
+    }
+
+    _execute() {
+        const prevValue = this._value;
+        const newValue = this._computeValue();
+        if (newValue !== prevValue) {
+            this._value = newValue;
+            this._prevVersion = this._version;
+            this._version = VERSION++;
+            this._shouldBlock = true;
+            this._notify(newValue);
+            this._shouldBlock = false;
+        }
+    }
+
+    /**
+     * Gets the value of the computed signal.
+     * @returns {T} The current value of the computed signal.
+     */
+    get value() {
+        // to prevent recurssions when accessed in a listener
+        if (this._shouldBlock) return this._value;
+        if (!currentEffect) {
+            activeSignals.add(this);
+        }
+        this._untrack();
+        this._execute();
+        this._track();
+        return this._value;
+    }
+}
+
+/**
+ * @typedef {EffectCallback | (() => (void | Promise<void | (() => void | Promise<void>)>))} AsyncEffectCallback
+ */
+
+/**
+ * Class representing an asynchronous effect.
+ * @extends Effect
+ */
+class AsyncEffect extends Effect {
+    /** @param {AsyncEffectCallback} callback **/
+    constructor(callback) {
+        // @ts-ignore
+        super(callback);
+    }
+
+    async _execute() {
+        currentEffect = this;
+        const shouldRecompute = [...this._dependents].some(
+            depObj => depObj._prevVersion !== depObj._version
+        );
+        if (shouldRecompute) {
+            const cleanup = await this._cleanup;
+            if (typeof cleanup === "function") {
+                await cleanup();
+                this._cleanup = undefined;
+            }
+            this._cleanup = await this._callback();
+            this._track();
+        }
+        currentEffect = null;
+    }
+
+    async _untrack() {
+        const cleanup = await this._cleanup;
+        if (typeof cleanup === "function") {
+            await cleanup();
+            this._cleanup = undefined;
+        }
+
+        this._dependents.forEach(dep => {
+            dep.removeDependent(this);
+        });
+
+        this._dependents.clear();
+    }
+    
+    _signalUpdateInEffect() {
+      // nothing to do here, just suppressing the error
+    }
+}
+
+/**
+ * Creates a reactive signal.
+ * @template T
+ * @param {T} initialValue - The initial value of the signal.
+ * @param {{deep: false}} [opts={deep: false}] - Options for the signal.
+ * @returns {Signal<T>} The created signal.
+ */
+function createSignal(initialValue, opts = { deep: false }) {
+    const base = new Signal(initialValue, opts);
+    return base;
+}
+
+/**
+ * Creates an effect that runs the given callback.
+ * @param {EffectCallback} callback - The callback function to run as an effect.
+ * @returns {() => void} A function to stop tracking the effect.
+ */
+function createEffect(callback) {
+    const effectInstance = new Effect(callback);
+    return effectInstance._untrack.bind(effectInstance);
+}
+
+/**
+ * Creates an asynchronous effect that runs the given callback.
+ * @param {AsyncEffectCallback} callback - The callback function to run as an async effect.
+ * @returns {() => Promise<void>} A function to stop tracking the effect.
+ */
+function createAsyncEffect(callback) {
+    const effectInstance = new AsyncEffect(callback);
+    return effectInstance._untrack.bind(effectInstance);
+}
+
+/**
+ * Creates a computed signal.
+ * @template T
+ * @param {() => T} compute - The compute function to create the computed signal.
+ * @returns {Computed<T>} The created computed signal.
+ */
+function createComputed(compute) {
+    const base = new Computed(compute);
+    return base;
+}
+
+if (!isBatching) {
+    activeSignals.forEach(signal => {
+        signal._notifyDependents();
+    });
+}
+
+/**
+ * Batches multiple updates together.
+ * @param {() => void} callback - The callback function containing updates to batch.
+ */
+function batch(callback) {
+    try {
+        isBatching = true;
+        callback();
+    } catch (e) {
+        throw e;
+    } finally {
+        if (true) {
+            activeSignals.forEach(signal => {
+                signal._notifyDependents();
+            });
+        }
+        isBatching = false;
+        activeSignals.clear();
+    }
+}
+
+/**
+ * Watches an array of signals and runs the callback on changes.
+ * @template T
+ * @param {Array<Signal<T>>} sigArr - Array of signals to watch.
+ * @param {(values: readonly T[]) => void | (() => void)} callback - Callback function to run on signal changes.
+ * @returns {() => void} A function to stop watching the signals.
+ */
+function watch(sigArr = [], callback) {
+    const arr = [...sigArr];
+    let last_res = [];
+    function listener() {
+        const res = [];
+        for (const sig of sigArr) {
+            res.push(sig.value);
+        }
+
+        const unsub = callback(Object.freeze(res));
+        last_res = res;
+        return () => {
+            last_res = [];
+            unsub?.();
+        };
+    }
+    return createEffect(listener);
+}
+
+export {
+    Signal,
+    createSignal,
+    createEffect,
+    createAsyncEffect,
+    createComputed,
+    watch,
+    batch
+};

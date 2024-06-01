@@ -1,0 +1,20 @@
+{
+  "name": "js-signals",
+  "version": "0.0.1-alpha",
+  "description": "lightweight reactive signals implementation ",
+  "main": "./dist/signals.js",
+  "types": "./dist/signals.d.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "signals",
+    "JavaScript",
+    "state",
+    "effect",
+    "computed",
+    "derived"
+  ],
+  "author": "Adeniji Oluwaferanmi",
+  "license": "MIT"
+}
